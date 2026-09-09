@@ -1,20 +1,10 @@
 [
   {
     "name": "Dubai Opera - Shows",
-    "url": "https://www.dubaiopera.com/en-US/products-list",
-    "source_type": "schema_org",
-    "city": "Dubai"
-  },
-  {
-    "name": "Dubai Calendar - Official Events",
-    "url": "https://www.dubaicalendar.ae/en/whats-on",
-    "source_type": "schema_org",
-    "city": "Dubai"
-  },
-  {
-    "name": "Visit Dubai - Events",
-    "url": "https://www.visitdubai.com/en/festivals-and-events/dubai-events-calendar",
-    "source_type": "schema_org",
+    "url": "https://www.dubaiopera.com/en/events",
+    "source_type": "schema_org_listing",
+    "follow_links_matching": "/en/events/",
+    "max_detail_pages": 20,
     "city": "Dubai"
   }
 ]

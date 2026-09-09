@@ -30,14 +30,30 @@ Requires env vars (see .env.example):
 
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
+from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
 from dateutil import parser as dateparser
 
 SOURCES_FILE = os.path.join(os.path.dirname(__file__), "sources.json")
+
+# A realistic browser header set. Several venue sites block the default
+# "python-requests" user agent as a basic bot filter; this isn't spoofing
+# a session or bypassing a login wall, just presenting like an ordinary
+# browser visit to a public page — the same page schema.org markup was
+# published for anyone (or anything) to read.
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 
 def get_supabase_config():
@@ -73,6 +89,29 @@ def supabase_insert(config: dict, table: str, row: dict) -> dict | None:
         return None
     data = resp.json()
     return data[0] if isinstance(data, list) and data else None
+
+
+def event_already_exists(config: dict, source_url: str) -> bool:
+    """Simple dedup guard for the skeleton: skip if we've already stored
+    this exact source URL. Real duplicate-matching across sources (title
+    similarity, venue, date proximity) is a later layer, not this one."""
+    resp = requests.get(
+        f"{config['rest_url']}/events",
+        headers=config["headers"],
+        params={"source_url": f"eq.{source_url}", "select": "id"},
+        timeout=20,
+    )
+    return resp.ok and len(resp.json()) > 0
+
+
+def fetch(url: str) -> requests.Response | None:
+    try:
+        resp = requests.get(url, timeout=20, headers=BROWSER_HEADERS)
+        resp.raise_for_status()
+        return resp
+    except requests.RequestException as exc:
+        print(f"  Failed to fetch {url}: {exc}", file=sys.stderr)
+        return None
 
 
 def extract_json_ld_events(html: str) -> list[dict]:
@@ -154,18 +193,40 @@ def run():
 
     for source in sources:
         print(f"Checking source: {source['name']} ({source['url']})")
-        try:
-            resp = requests.get(
-                source["url"],
-                timeout=20,
-                headers={"User-Agent": "MyLocalCalendarBot/0.1 (+schema.org Event ingestion)"},
-            )
-            resp.raise_for_status()
-        except requests.RequestException as exc:
-            print(f"  Failed to fetch: {exc}", file=sys.stderr)
+        resp = fetch(source["url"])
+        if resp is None:
             continue
 
-        raw_events = extract_json_ld_events(resp.text)
+        pages_to_check = [resp.text]
+
+        # Many venue sites publish Event markup on each show's own page
+        # rather than on the listing page itself. When a source declares
+        # a link pattern to follow, discover those detail-page URLs from
+        # the listing and fetch a bounded number of them too.
+        link_pattern = source.get("follow_links_matching")
+        if link_pattern:
+            soup = BeautifulSoup(resp.text, "html.parser")
+            detail_urls = []
+            seen = set()
+            for a in soup.find_all("a", href=True):
+                href = urljoin(source["url"], a["href"])
+                if re.search(link_pattern, href) and href not in seen:
+                    seen.add(href)
+                    detail_urls.append(href)
+
+            max_pages = source.get("max_detail_pages", 20)
+            detail_urls = detail_urls[:max_pages]
+            print(f"  Following {len(detail_urls)} detail page(s) matching '{link_pattern}'.")
+
+            for detail_url in detail_urls:
+                detail_resp = fetch(detail_url)
+                if detail_resp is not None:
+                    pages_to_check.append(detail_resp.text)
+
+        raw_events = []
+        for html in pages_to_check:
+            raw_events.extend(extract_json_ld_events(html))
+
         print(f"  Found {len(raw_events)} Event object(s) with schema.org markup.")
         total_found += len(raw_events)
 
@@ -178,6 +239,10 @@ def run():
 
             if config is None:
                 print(f"  [dry-run] Would upsert: {normalized['title']} @ {normalized['start_datetime']}")
+                continue
+
+            if normalized["source_url"] and event_already_exists(config, normalized["source_url"]):
+                print(f"  Already stored, skipping: {normalized['title']}")
                 continue
 
             # Minimal insert path for the skeleton: this does not yet do
