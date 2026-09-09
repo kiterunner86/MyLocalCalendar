@@ -7,6 +7,13 @@ The cleanest, lowest-legal-risk ingestion connector: parses JSON-LD
 scraping-controversy here — this is data the site owner explicitly
 published for machines to consume.
 
+Talks to Supabase's REST API (PostgREST) directly over plain HTTP rather
+than the `supabase-py` client library, which currently doesn't reliably
+support Supabase's newer `sb_secret_...` / `sb_publishable_...` API key
+format (it raises "Invalid API key" locally before making any request).
+Plain REST calls with the key in the `apikey`/`Authorization` headers
+avoid that entirely and add one less dependency.
+
 Usage:
     python schema_org_ingest.py
 
@@ -16,9 +23,9 @@ normalizes them, and upserts into Supabase.
 
 Requires env vars (see .env.example):
     NEXT_PUBLIC_SUPABASE_URL
-    SUPABASE_SERVICE_ROLE_KEY   (service role — this script writes data,
-                                 so it must bypass RLS; never expose this
-                                 key in frontend code)
+    SUPABASE_SERVICE_ROLE_KEY   (service-role/secret key — this script
+                                 writes data, so it must bypass RLS;
+                                 never expose this key in frontend code)
 """
 
 import json
@@ -29,13 +36,12 @@ from datetime import datetime, timezone
 import requests
 from bs4 import BeautifulSoup
 from dateutil import parser as dateparser
-from supabase import create_client, Client
 
 SOURCES_FILE = os.path.join(os.path.dirname(__file__), "sources.json")
 
 
-def get_supabase_client() -> Client:
-    url = os.environ.get("NEXT_PUBLIC_SUPABASE_URL")
+def get_supabase_config():
+    url = os.environ.get("NEXT_PUBLIC_SUPABASE_URL", "").rstrip("/")
     key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
     if not url or not key:
         print(
@@ -44,7 +50,29 @@ def get_supabase_client() -> Client:
             file=sys.stderr,
         )
         return None
-    return create_client(url, key)
+    return {
+        "rest_url": f"{url}/rest/v1",
+        "headers": {
+            "apikey": key,
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            "Prefer": "return=representation",
+        },
+    }
+
+
+def supabase_insert(config: dict, table: str, row: dict) -> dict | None:
+    resp = requests.post(
+        f"{config['rest_url']}/{table}",
+        headers=config["headers"],
+        json=row,
+        timeout=20,
+    )
+    if not resp.ok:
+        print(f"  Supabase insert into {table} failed ({resp.status_code}): {resp.text}", file=sys.stderr)
+        return None
+    data = resp.json()
+    return data[0] if isinstance(data, list) and data else None
 
 
 def extract_json_ld_events(html: str) -> list[dict]:
@@ -121,7 +149,7 @@ def run():
     with open(SOURCES_FILE) as f:
         sources = json.load(f)
 
-    supabase = get_supabase_client()
+    config = get_supabase_config()
     total_found = 0
 
     for source in sources:
@@ -148,11 +176,11 @@ def run():
                 print(f"  Skipping incomplete event: {normalized.get('title')}")
                 continue
 
-            if supabase is None:
+            if config is None:
                 print(f"  [dry-run] Would upsert: {normalized['title']} @ {normalized['start_datetime']}")
                 continue
 
-            # Minimal upsert path for the skeleton: this does not yet do
+            # Minimal insert path for the skeleton: this does not yet do
             # venue normalization or duplicate matching against other
             # sources — that's the next layer to build once this pipeline
             # is proven end-to-end.
@@ -166,18 +194,20 @@ def run():
                 "status": "published",
                 "last_verified_at": datetime.now(timezone.utc).isoformat(),
             }
-            result = supabase.table("events").insert(event_row).execute()
-            event_id = result.data[0]["id"] if result.data else None
+            inserted = supabase_insert(config, "events", event_row)
+            event_id = inserted["id"] if inserted else None
 
             if event_id and normalized["start_datetime"]:
-                supabase.table("event_occurrences").insert(
+                supabase_insert(
+                    config,
+                    "event_occurrences",
                     {
                         "event_id": event_id,
                         "start_datetime": normalized["start_datetime"],
                         "is_free": normalized["price"] in (None, "0", 0),
                         "price_min": normalized["price"],
-                    }
-                ).execute()
+                    },
+                )
                 print(f"  Inserted: {normalized['title']}")
 
     print(f"\nDone. {total_found} event object(s) found across {len(sources)} source(s).")
