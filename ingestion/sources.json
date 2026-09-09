@@ -1,0 +1,8 @@
+[
+  {
+    "name": "EXAMPLE - replace with a real Dubai source that publishes schema.org/Event markup",
+    "url": "https://example.com/events",
+    "source_type": "schema_org",
+    "city": "Dubai"
+  }
+]
