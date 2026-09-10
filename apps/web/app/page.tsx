@@ -1,5 +1,11 @@
 import { supabase } from "@/lib/supabaseClient";
 
+// This page reads live event data from Supabase. Force it to render per
+// request instead of being statically prerendered at build time — the
+// build sandbox may not have a network path to Supabase, and event data
+// changes constantly anyway, so a build-time snapshot is the wrong model.
+export const dynamic = "force-dynamic";
+
 type Occurrence = {
   id: string;
   start_datetime: string;
